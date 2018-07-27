@@ -1,108 +1,87 @@
-//  OpenShift sample Node application
-var express = require('express'),
-    app     = express(),
-    morgan  = require('morgan');
+//server side for chat
+var express=require('express');
+var app=express();
+var socket = require('socket.io');
+app.use(express.static('public'));
+var queue = {};    // list of sockets waiting for peers
+var rooms = {};    // map socket.id => room
+var names = {};    // map socket.id => name
+var allUsers = {}; // map socket.id => socket
+var io = socket(server);
+var port = process.env.PORT || process.env.OPENSHIFT_NODEJS_PORT || 8080;
+var  ip   = process.env.IP   || process.env.OPENSHIFT_NODEJS_IP || '127.0.0.1';
+var server = app.listen(port,ip);
+console.log('on server');
+function findPeerForLoneSocket(socket) {
     
-Object.assign=require('object-assign')
-
-app.engine('html', require('ejs').renderFile);
-app.use(morgan('combined'))
-
-var port = process.env.PORT || process.env.OPENSHIFT_NODEJS_PORT || 8080,
-    ip   = process.env.IP   || process.env.OPENSHIFT_NODEJS_IP || '0.0.0.0',
-    mongoURL = process.env.OPENSHIFT_MONGODB_DB_URL || process.env.MONGO_URL,
-    mongoURLLabel = "";
-
-if (mongoURL == null && process.env.DATABASE_SERVICE_NAME) {
-  var mongoServiceName = process.env.DATABASE_SERVICE_NAME.toUpperCase(),
-      mongoHost = process.env[mongoServiceName + '_SERVICE_HOST'],
-      mongoPort = process.env[mongoServiceName + '_SERVICE_PORT'],
-      mongoDatabase = process.env[mongoServiceName + '_DATABASE'],
-      mongoPassword = process.env[mongoServiceName + '_PASSWORD']
-      mongoUser = process.env[mongoServiceName + '_USER'];
-
-  if (mongoHost && mongoPort && mongoDatabase) {
-    mongoURLLabel = mongoURL = 'mongodb://';
-    if (mongoUser && mongoPassword) {
-      mongoURL += mongoUser + ':' + mongoPassword + '@';
+	if (queue.id!=undefined && names[queue.id]!=undefined) {
+        // somebody is in queue, pair them!
+		var peer = queue;
+        var room = socket.id + '#' + peer.id;
+        // join them both
+        peer.join(room);
+        socket.join(room);
+        // register rooms to their names
+        rooms[peer.id] = room;
+        rooms[socket.id] = room;
+        // exchange names between the two of them and start the chat
+        peer.emit('chat start', {'name': names[socket.id], 'room':room});
+        socket.emit('chat start', {'name': names[peer.id], 'room':room});
+		console.log('room is '+room+' between '+names[socket.id]+' and '+names[peer.id]);
+		queue={};
+    } else {
+        // queue is empty, add our lone socket
+		if(socket){
+			queue=socket;
+			console.log(queue.id+' loner user');
+		}	
     }
-    // Provide UI label that excludes user id and pw
-    mongoURLLabel += mongoHost + ':' + mongoPort + '/' + mongoDatabase;
-    mongoURL += mongoHost + ':' +  mongoPort + '/' + mongoDatabase;
-
-  }
+	
 }
-var db = null,
-    dbDetails = new Object();
 
-var initDb = function(callback) {
-  if (mongoURL == null) return;
-
-  var mongodb = require('mongodb');
-  if (mongodb == null) return;
-
-  mongodb.connect(mongoURL, function(err, conn) {
-    if (err) {
-      callback(err);
-      return;
-    }
-
-    db = conn;
-    dbDetails.databaseName = db.databaseName;
-    dbDetails.url = mongoURLLabel;
-    dbDetails.type = 'MongoDB';
-
-    console.log('Connected to MongoDB at: %s', mongoURL);
-  });
-};
-
-app.get('/', function (req, res) {
-  // try to initialize the db on every request if it's not already
-  // initialized.
-  if (!db) {
-    initDb(function(err){});
-  }
-  if (db) {
-    var col = db.collection('counts');
-    // Create a document with request IP and current time of request
-    col.insert({ip: req.ip, date: Date.now()});
-    col.count(function(err, count){
-      if (err) {
-        console.log('Error running count. Message:\n'+err);
-      }
-      res.render('index.html', { pageCountMessage : count, dbInfo: dbDetails });
+io.on('connection', function (socket) {
+	
+    console.log('User '+socket.id+' connected');
+	
+    socket.on('login', function (data) {
+        names[socket.id] = data.name;
+        allUsers[socket.id] = socket;
+        // now check if sb is in queue
+		console.log('user '+data.name);
+        findPeerForLoneSocket(socket);
     });
-  } else {
-    res.render('index.html', { pageCountMessage : null});
-  }
-});
-
-app.get('/pagecount', function (req, res) {
-  // try to initialize the db on every request if it's not already
-  // initialized.
-  if (!db) {
-    initDb(function(err){});
-  }
-  if (db) {
-    db.collection('counts').count(function(err, count ){
-      res.send('{ pageCount: ' + count + '}');
+	
+    socket.on('sendMessage', function (data) {
+        var room = rooms[socket.id];
+        socket.broadcast.to(room).emit('sendMessage', data);
     });
-  } else {
-    res.send('{ pageCount: -1 }');
-  }
+
+	socket.on('typing', function (data) {   
+        var room = rooms[socket.id];
+        socket.broadcast.to(room).emit('typing',data);
+    });
+	
+	socket.on('nottyping', function () {   
+        var room = rooms[socket.id];
+        socket.broadcast.to(room).emit('nottyping');
+	});	
+	
+	socket.on('disconnect', function () {
+		var room = rooms[socket.id];
+		console.log('roomwas: '+room);
+		console.log('userdisconnected: '+names[socket.id]);
+		delete names[socket.id];
+		delete allUsers[socket.id];
+		if(room){
+			socket.broadcast.to(room).emit('chat end');
+			var peerID = room.split('#');
+			peerID = peerID[0] === socket.id ? peerID[1] : peerID[0];
+			// current socket left, add the other one to the queue
+			findPeerForLoneSocket(allUsers[peerID]);
+			
+		}	
+		console.log('users left: '+JSON.stringify(names));
+    });
+	
+	
 });
-
-// error handling
-app.use(function(err, req, res, next){
-  console.error(err.stack);
-  res.status(500).send('Something bad happened!');
-});
-
-initDb(function(err){
-  console.log('Error connecting to Mongo. Message:\n'+err);
-});
-
-app.listen(port, ip);
-console.log('Server running on http://%s:%s', ip, port);
-
-module.exports = app ;
